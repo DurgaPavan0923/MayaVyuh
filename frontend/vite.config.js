@@ -6,10 +6,8 @@ import { resolve } from 'path'
 export default defineConfig({
   plugins: [react()],
 
-  // Use VITE_BASE env var to set the base path.
-  // On Vercel: set VITE_BASE=/ in environment variables.
-  // On GitHub Pages: keep default '/MayaVyuh/'
-  base: process.env.VITE_BASE || '/MayaVyuh/',
+  // '/' for Vercel. For GitHub Pages, set VITE_BASE=/MayaVyuh/ as an env var before building.
+  base: process.env.VITE_BASE || '/',
 
   resolve: {
     alias: {
