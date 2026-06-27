@@ -3,7 +3,7 @@ const dns = require('dns');
 // Set DNS servers to Google's public DNS to resolve MongoDB Atlas SRV records reliably
 dns.setServers(['8.8.8.8', '8.8.4.4']);
 
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { v4: uuidv4 } = require('uuid');
 const express = require('express');
 const http = require('http');
@@ -35,6 +35,7 @@ const multer = require('multer');
 
 const upload = multer({
   storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }
 });
 
 const openai = new OpenAI({
@@ -57,35 +58,38 @@ mongoose.connect(process.env.MONGO_URI)
   })
   .catch(err => console.log("MongoDB Connection Error:", err));
 
-app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => {
+app.post('/api/admin/upload-image', upload.array('images'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: "No file uploaded" });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ success: false, message: "No files uploaded" });
     }
 
-    const fileContent = req.file.buffer;
-    const extension = req.file.originalname.split('.').pop().replace(/[^a-zA-Z0-9]/g, '');
-    const key = `reference/${uuidv4()}.${extension}`;
+    const uploadedUrls = [];
 
-    const command = new PutObjectCommand({
-      Bucket: process.env.AWS_S3_BUCKET_NAME,
-      Key: key,
-      Body: fileContent,
-      ContentType: req.file.mimetype,
-    });
+    for (const file of req.files) {
+      const fileContent = file.buffer;
+      const extension = file.originalname.split('.').pop().replace(/[^a-zA-Z0-9]/g, '');
+      const key = `reference/${uuidv4()}.${extension}`;
 
-    await s3.send(command);
+      const command = new PutObjectCommand({
+        Bucket: process.env.AWS_S3_BUCKET_NAME,
+        Key: key,
+        Body: fileContent,
+        ContentType: file.mimetype,
+      });
 
-    const fullUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+      await s3.send(command);
 
-    const newImage = new ImageBank({
-      url: fullUrl,
-    });
-    await newImage.save();
+      const fullUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+      uploadedUrls.push(fullUrl);
+
+      const newImage = new ImageBank({ url: fullUrl });
+      await newImage.save();
+    }
 
     res.json({
       success: true,
-      url: fullUrl
+      urls: uploadedUrls
     });
 
   } catch (err) {
@@ -211,6 +215,17 @@ app.post('/api/admin/images', async (req, res) => {
 
 app.delete('/api/admin/images/:id', async (req, res) => {
   try {
+    const image = await ImageBank.findById(req.params.id);
+    if (image && image.url && image.url.includes('.amazonaws.com/')) {
+      const key = image.url.split('.amazonaws.com/')[1];
+      if (key) {
+        const deleteCommand = new DeleteObjectCommand({
+          Bucket: process.env.AWS_S3_BUCKET_NAME,
+          Key: key
+        });
+        await s3.send(deleteCommand).catch(err => console.error("S3 Delete Error:", err));
+      }
+    }
     await ImageBank.findByIdAndDelete(req.params.id);
     res.json({ success: true });
   } catch (err) {
