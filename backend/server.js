@@ -57,35 +57,40 @@ mongoose.connect(process.env.MONGO_URI)
   })
   .catch(err => console.log("MongoDB Connection Error:", err));
 
-app.post('/api/admin/upload-image', upload.single('image'), async (req, res) => {
+app.post('/api/admin/upload-image', upload.array('images'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: "No file uploaded" });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ success: false, message: "No files uploaded" });
     }
 
-    const fileContent = req.file.buffer;
-    const extension = req.file.originalname.split('.').pop().replace(/[^a-zA-Z0-9]/g, '');
-    const key = `reference/${uuidv4()}.${extension}`;
+    const uploadedUrls = [];
 
-    const command = new PutObjectCommand({
-      Bucket: process.env.AWS_S3_BUCKET_NAME,
-      Key: key,
-      Body: fileContent,
-      ContentType: req.file.mimetype,
-    });
+    for (const file of req.files) {
+      const fileContent = file.buffer;
+      const extension = file.originalname.split('.').pop().replace(/[^a-zA-Z0-9]/g, '');
+      const key = `reference/${uuidv4()}.${extension}`;
 
-    await s3.send(command);
+      const command = new PutObjectCommand({
+        Bucket: process.env.AWS_S3_BUCKET_NAME,
+        Key: key,
+        Body: fileContent,
+        ContentType: file.mimetype,
+      });
 
-    const fullUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+      await s3.send(command);
 
-    const newImage = new ImageBank({
-      url: fullUrl,
-    });
-    await newImage.save();
+      const fullUrl = `https://${process.env.AWS_S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+      uploadedUrls.push(fullUrl);
+
+      const newImage = new ImageBank({
+        url: fullUrl,
+      });
+      await newImage.save();
+    }
 
     res.json({
       success: true,
-      url: fullUrl
+      urls: uploadedUrls
     });
 
   } catch (err) {

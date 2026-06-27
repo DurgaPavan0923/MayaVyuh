@@ -596,11 +596,13 @@ const ImageVaultSection = () => {
   };
 
   const handleUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
     setLoading(true);
     const formData = new FormData();
-    formData.append("image", file);
+    for (let i = 0; i < files.length; i++) {
+      formData.append("images", files[i]);
+    }
     try {
       await fetch("https://mayavyuh.onrender.com/api/admin/upload-image", { method: "POST", body: formData });
       fetchImages();
@@ -622,7 +624,7 @@ const ImageVaultSection = () => {
         <div style={{ display: "flex", gap: 16 }}>
           <label className="btn-imperial" style={{ padding: "12px 32px", fontSize: 12, letterSpacing: 2 }}>
             {loading ? "UPLOADING..." : "UPLOAD ARTIFACT"}
-            <input type="file" accept="image/*" style={{ display: "none" }} onChange={handleUpload} disabled={loading} />
+            <input type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleUpload} disabled={loading} />
           </label>
         </div>
       </div>
