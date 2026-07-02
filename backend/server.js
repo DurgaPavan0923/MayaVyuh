@@ -165,6 +165,13 @@ app.post('/api/player/upload-submission', upload.single('image'), async (req, re
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
+    try {
+      const imgField = round == 1 ? 'r1Img' : (round == 2 ? 'r2Img' : (round == 3 ? 'r3Img' : 'finalImage'));
+      await Team.findByIdAndUpdate(teamId, { [imgField]: fullUrl, finalImage: fullUrl });
+    } catch (e) {
+      console.error("Failed to update team image field:", e);
+    }
+
     res.json({ success: true, url: fullUrl });
 
   } catch (err) {
@@ -277,6 +284,29 @@ app.delete('/api/admin/images/:id', async (req, res) => {
   }
 });
 
+// Simple Semaphore to limit concurrent Python spawns so 100+ players don't crash OS memory
+const MAX_CONCURRENT_PYTHON = 3;
+let currentPythonWorkers = 0;
+const pythonQueue = [];
+
+const acquirePythonLock = () => new Promise(resolve => {
+  if (currentPythonWorkers < MAX_CONCURRENT_PYTHON) {
+    currentPythonWorkers++;
+    resolve();
+  } else {
+    pythonQueue.push(resolve);
+  }
+});
+
+const releasePythonLock = () => {
+  if (pythonQueue.length > 0) {
+    const next = pythonQueue.shift();
+    next();
+  } else {
+    currentPythonWorkers--;
+  }
+};
+
 app.post('/api/similarity', async (req, res) => {
   try {
     const { teamId, original_url, submitted_url } = req.body;
@@ -295,11 +325,13 @@ app.post('/api/similarity', async (req, res) => {
           const data = await response.json();
           if (data && data.similarity_score !== undefined) {
             if (teamId && Team && Team.findByIdAndUpdate) {
-              await Team.findByIdAndUpdate(teamId, { 
-                  score: data.similarity_score, 
-                  finalImageUrl: submitted_url,
-                  referenceImageUrl: original_url
-              });
+              try {
+                await Team.findByIdAndUpdate(teamId, { 
+                    score: data.similarity_score, 
+                    finalImageUrl: submitted_url,
+                    referenceImageUrl: original_url
+                });
+              } catch (dbErr) { console.log("DB update ignored:", dbErr.message); }
               try {
                 const Submission = require('../models/Submission');
                 await Submission.findOneAndUpdate(
@@ -323,11 +355,13 @@ app.post('/api/similarity', async (req, res) => {
 
     const pythonCommands = process.env.PYTHON_PATH ? [process.env.PYTHON_PATH] : (process.platform === 'win32' ? ['py', 'python', 'python3'] : ['python3', 'python']);
 
-    let executed = false;
-    for (const cmd of pythonCommands) {
-      try {
-        await new Promise((resolve, reject) => {
-          execFile(cmd, [scriptPath, original_url, submitted_url], { maxBuffer: 1024 * 1024 * 50, timeout: 120000 }, async (error, stdout, stderr) => {
+    await acquirePythonLock();
+    try {
+      let executed = false;
+      for (const cmd of pythonCommands) {
+        try {
+          await new Promise((resolve, reject) => {
+            execFile(cmd, [scriptPath, original_url, submitted_url], { maxBuffer: 1024 * 1024 * 50, timeout: 120000 }, async (error, stdout, stderr) => {
             if (error && error.code === 'ENOENT') {
               return reject(error);
             }
@@ -364,11 +398,13 @@ app.post('/api/similarity', async (req, res) => {
               const score = data.similarity_score;
               
               if (teamId && Team && Team.findByIdAndUpdate) {
-                  await Team.findByIdAndUpdate(teamId, { 
-                      score: score, 
-                      finalImageUrl: submitted_url,
-                      referenceImageUrl: original_url
-                  });
+                  try {
+                    await Team.findByIdAndUpdate(teamId, { 
+                        score: score, 
+                        finalImageUrl: submitted_url,
+                        referenceImageUrl: original_url
+                    });
+                  } catch (dbErr) { console.log("DB update ignored:", dbErr.message); }
                   
                   try {
                     const Submission = require('../models/Submission');
@@ -397,6 +433,9 @@ app.post('/api/similarity', async (req, res) => {
     }
     if (!executed) {
       res.status(500).json({ error: "Python executable not found on server" });
+    }
+    } finally {
+      releasePythonLock();
     }
   } catch (err) {
     console.error("Similarity Error:", err);

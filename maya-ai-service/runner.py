@@ -34,8 +34,12 @@ def main():
                 out_file.write(response.read())
             return tmp.name, tmp.name
 
-        path1, tmp1_path = get_local_path(url1)
-        path2, tmp2_path = get_local_path(url2)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            future1 = executor.submit(get_local_path, url1)
+            future2 = executor.submit(get_local_path, url2)
+            path1, tmp1_path = future1.result()
+            path2, tmp2_path = future2.result()
             
         # Load model and compare
         model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_models/siamese_model.pth")
