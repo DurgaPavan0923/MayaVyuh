@@ -142,5 +142,6 @@ def run(server_class=HTTPServer, handler_class=SiameseRequestHandler, port=5001)
     httpd.server_close()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 0)) or (int(sys.argv[1]) if len(sys.argv) > 1 else 5001)
+    # CLI arg takes priority over PORT env var (PORT is used by the parent Node server)
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
     run(port=port)
