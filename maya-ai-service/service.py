@@ -66,12 +66,19 @@ def get_local_path(url):
     return tmp.name, tmp.name
 
 def preprocess(image_path):
-    img = Image.open(image_path).convert('RGB')
-    img = img.resize((224, 224), Image.Resampling.LANCZOS)
+    img = Image.open(image_path)
+    # Match comparison.py: thumbnail to 512 first (BILINEAR, aspect-preserving)
+    try:
+        resample = Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+        img.thumbnail((512, 512), resample)
+    except Exception:
+        pass
+    img = img.convert('RGB')
+    # Resize to 224x224 with BILINEAR (same as torchvision.transforms.Resize default)
+    img = img.resize((224, 224), Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR)
+    # ToTensor: scale to [0, 1] only — NO ImageNet normalization (model wasn't trained with it)
     img_data = np.array(img).astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    img_data = (img_data - mean) / std
+    # HWC to CHW
     img_data = np.transpose(img_data, (2, 0, 1))
     return np.expand_dims(img_data, axis=0)
 
