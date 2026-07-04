@@ -1,7 +1,10 @@
 services:
   - type: web
     name: mayavyuh-backend
-    env: docker
+    env: node
+    rootDir: backend
+    buildCommand: "npm install && pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && pip install --no-cache-dir opencv-python-headless numpy scikit-image Pillow scikit-learn"
+    startCommand: npm start
     envVars:
       - key: PORT
         value: 10000
