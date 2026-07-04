@@ -356,54 +356,7 @@ const releasePythonLock = () => {
   }
 };
 
-const computeFallbackSimilarity = async (url1, url2, teamId) => {
-  try {
-    const cleanWords = (url) => {
-      try {
-        const decoded = decodeURIComponent(url);
-        const stopwords = new Set(['https', 'http', 'www', 'image', 'pollinations', 'ai', 'prompt', 'seed', 'width', 'height', 'nologo', 'model', 'jpg', 'png', 'jpeg', 'webp', 'picsum', 'photos', 'id', 'com', 'net', 'org', 'the', 'a', 'an', 'of', 'in', 'and', 'with', 'on', 'for', 'to', 'by', 'at', 'from', 'as', 'is', 'it']);
-        return decoded.replace(/[^a-zA-Z]+/g, ' ').toLowerCase().split(/\s+/).filter(w => w.length > 2 && !stopwords.has(w));
-      } catch (e) { return []; }
-    };
-    const words1 = cleanWords(url1);
-    const words2 = cleanWords(url2);
-    let score = 78.5;
-    if (words1.length > 0 && words2.length > 0) {
-      const set1 = new Set(words1);
-      const set2 = new Set(words2);
-      let matches = 0;
-      for (const w of set2) { if (set1.has(w)) matches++; }
-      const jaccard = matches / (set1.size + set2.size - matches || 1);
-      score = 68.0 + (jaccard * 26.0); // Map to 68.0 - 94.0
-    } else {
-      let hash = 0;
-      const str = String(teamId || "") + String(url1) + String(url2);
-      for (let i = 0; i < str.length; i++) { hash = (hash * 31 + str.charCodeAt(i)) % 1000; }
-      score = 71.0 + (hash % 180) / 10.0; // Map to 71.0 - 89.0
-    }
-    const finalScore = Math.round(score * 10) / 10;
-    if (teamId && Team && Team.findByIdAndUpdate) {
-      try {
-        await Team.findByIdAndUpdate(teamId, {
-          score: finalScore,
-          finalImageUrl: url2,
-          referenceImageUrl: url1
-        });
-      } catch (dbErr) { }
-      try {
-        const Submission = require('../models/Submission');
-        await Submission.findOneAndUpdate(
-          { team: teamId, round: 3 },
-          { similarityScore: finalScore },
-          { sort: { timestamp: -1 } }
-        );
-      } catch (err) { }
-    }
-    return { similarity_score: finalScore, fallback_mode: true };
-  } catch (err) {
-    return { similarity_score: 76.5, fallback_mode: true };
-  }
-};
+
 
 app.post('/api/similarity', async (req, res) => {
   const simStart = Date.now();
@@ -512,16 +465,16 @@ app.post('/api/similarity', async (req, res) => {
       for (const cmd of pythonCommands) {
         try {
           await new Promise((resolve, reject) => {
-            execFile(cmd, [scriptPath, original_url, submitted_url], { maxBuffer: 1024 * 1024 * 50, timeout: 3500 }, async (error, stdout, stderr) => {
+            execFile(cmd, [scriptPath, original_url, submitted_url], { maxBuffer: 1024 * 1024 * 50, timeout: 120000 }, async (error, stdout, stderr) => {
               if (error && error.code === 'ENOENT') {
                 return reject(error);
               }
               executed = true;
               if (error && !stdout) {
-                console.error("AI Model error, using smart fallback:", error, stderr);
-                const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-                pushSimLog({ similarityStatus: 'FAIL', similarityScore: fb.similarity_score, source: 'PYTHON_FALLBACK', fallbackMode: true, error: 'Python process error: ' + (error.message || stderr), teamId, originalUrl: original_url, submittedUrl: submitted_url });
-                res.json(fb);
+                const errMsg = 'Python process error: ' + (error.message || '') + ' | stderr: ' + (stderr || '');
+                console.error("AI Model FAILED:", errMsg);
+                pushSimLog({ similarityStatus: 'ERROR', source: 'PYTHON_MODEL', fallbackMode: false, error: errMsg, teamId, originalUrl: original_url, submittedUrl: submitted_url });
+                res.status(500).json({ error: errMsg, similarity_score: null });
                 return resolve();
               }
               try {
@@ -546,9 +499,10 @@ app.post('/api/similarity', async (req, res) => {
                 if (!data) throw new Error("No valid JSON found in Python output: " + stdout);
 
                 if (data.error) {
-                  const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-                  pushSimLog({ similarityStatus: 'FAIL', similarityScore: fb.similarity_score, source: 'PYTHON_FALLBACK', fallbackMode: true, error: 'Python returned error: ' + data.error, teamId, originalUrl: original_url, submittedUrl: submitted_url });
-                  res.json(fb);
+                  const errMsg = 'Python returned error: ' + data.error;
+                  console.error("AI Model returned error:", errMsg);
+                  pushSimLog({ similarityStatus: 'ERROR', source: 'PYTHON_MODEL', fallbackMode: false, error: errMsg, teamId, originalUrl: original_url, submittedUrl: submitted_url });
+                  res.status(500).json({ error: errMsg, similarity_score: null });
                   return resolve();
                 }
 
@@ -577,10 +531,10 @@ app.post('/api/similarity', async (req, res) => {
                 res.json(data);
                 resolve();
               } catch (e) {
-                console.error("Failed to parse AI output, using smart fallback:", stdout, e);
-                const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-                pushSimLog({ similarityStatus: 'FAIL', similarityScore: fb.similarity_score, source: 'PYTHON_FALLBACK', fallbackMode: true, error: 'Parse error: ' + e.message, teamId, originalUrl: original_url, submittedUrl: submitted_url });
-                res.json(fb);
+                const errMsg = 'Failed to parse Python output: ' + e.message + ' | stdout: ' + (stdout || '');
+                console.error("AI parse FAILED:", errMsg);
+                pushSimLog({ similarityStatus: 'ERROR', source: 'PYTHON_MODEL', fallbackMode: false, error: errMsg, teamId, originalUrl: original_url, submittedUrl: submitted_url });
+                res.status(500).json({ error: errMsg, similarity_score: null });
                 resolve();
               }
             });
@@ -592,18 +546,16 @@ app.post('/api/similarity', async (req, res) => {
         }
       }
       if (!executed) {
-        const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-        pushSimLog({ similarityStatus: 'FAIL', similarityScore: fb.similarity_score, source: 'FALLBACK_NO_PYTHON', fallbackMode: true, error: 'No Python interpreter found', teamId, originalUrl: original_url, submittedUrl: submitted_url });
-        res.json(fb);
+        pushSimLog({ similarityStatus: 'ERROR', source: 'NO_PYTHON', fallbackMode: false, error: 'No Python interpreter found on server', teamId, originalUrl: original_url, submittedUrl: submitted_url });
+        res.status(500).json({ error: 'No Python interpreter found on server', similarity_score: null });
       }
     } finally {
       releasePythonLock();
     }
   } catch (err) {
-    console.error("Similarity Error, using smart fallback:", err);
-    const fb = await computeFallbackSimilarity(req.body?.original_url || "", req.body?.submitted_url || "", req.body?.teamId);
-    pushSimLog({ similarityStatus: 'ERROR', error: err.message, source: 'EXCEPTION', fallbackMode: true, similarityScore: fb.similarity_score, teamId: req.body?.teamId });
-    res.json(fb);
+    console.error("Similarity CRITICAL ERROR:", err);
+    pushSimLog({ similarityStatus: 'ERROR', error: err.message, source: 'EXCEPTION', fallbackMode: false, teamId: req.body?.teamId });
+    res.status(500).json({ error: 'Similarity service failed: ' + err.message, similarity_score: null });
   }
 });
 
