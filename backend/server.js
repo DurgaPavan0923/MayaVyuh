@@ -42,6 +42,55 @@ const upload = multer({
 
 // OpenAI removed, using Hugging Face Inference API
 
+// ============================================================
+// IN-MEMORY API LOG STORE
+// Capped at 500 entries (FIFO). Resets on server restart.
+// ============================================================
+const apiLogs = [];
+const MAX_API_LOGS = 500;
+
+const pushLog = (entry) => {
+  apiLogs.push({ id: Date.now() + '-' + Math.random().toString(36).slice(2, 8), ...entry });
+  if (apiLogs.length > MAX_API_LOGS) apiLogs.splice(0, apiLogs.length - MAX_API_LOGS);
+};
+
+// ── API Request Logging Middleware ──
+app.use((req, res, next) => {
+  // Only log /api routes
+  if (!req.path.startsWith('/api')) return next();
+  // Skip the logs endpoint itself to avoid recursion
+  if (req.path === '/api/admin/logs') return next();
+
+  const start = Date.now();
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    const duration = Date.now() - start;
+    pushLog({
+      timestamp: new Date().toISOString(),
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      durationMs: duration,
+      category: req.path.includes('/similarity') ? 'similarity' : 'general',
+    });
+    return originalJson(body);
+  };
+  next();
+});
+
+// ── Admin: Fetch API Logs ──
+app.get('/api/admin/logs', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 200, MAX_API_LOGS);
+  const logs = apiLogs.slice(-limit).reverse();
+  res.json({ success: true, logs });
+});
+
+// ── Admin: Clear API Logs ──
+app.delete('/api/admin/logs', (req, res) => {
+  apiLogs.length = 0;
+  res.json({ success: true, message: 'Logs cleared' });
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
@@ -51,6 +100,18 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 5000;
+
+// Start the Python Siamese daemon in the background
+const { spawn } = require('child_process');
+const path = require('path');
+const servicePath = path.join(__dirname, '../maya-ai-service/service.py');
+const pythonCmd = process.env.PYTHON_PATH ? process.env.PYTHON_PATH : (process.platform === 'win32' ? 'python' : 'python3');
+
+console.log('Starting Python Siamese Daemon on port 5050...');
+const pythonDaemon = spawn(pythonCmd, [servicePath, '5050']);
+pythonDaemon.stdout.on('data', data => console.log('Python Daemon:', data.toString().trim()));
+pythonDaemon.stderr.on('data', data => console.error('Python Daemon Error:', data.toString().trim()));
+pythonDaemon.on('close', code => console.log('Python Daemon exited with code', code));
 
 if (process.env.MONGO_URI) {
   mongoose.connect(process.env.MONGO_URI)
@@ -100,7 +161,7 @@ app.post('/api/admin/upload-image', upload.array('images'), async (req, res) => 
       const fullUrl = `https://${(process.env.AWS_S3_BUCKET_NAME || process.env.AWS_S3_Bucket_name)}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
       uploadedUrls.push(fullUrl);
 
-      const newImage = new ImageBank({ 
+      const newImage = new ImageBank({
         url: fullUrl,
         teamNumber: nextTeamNumber,
         filename: filename
@@ -137,7 +198,7 @@ app.post('/api/player/upload-submission', upload.single('image'), async (req, re
 
     const fileContent = req.file.buffer;
     const extension = req.file.originalname.split('.').pop().replace(/[^a-zA-Z0-9]/g, '');
-    
+
     const team = await Team.findById(teamId);
     if (!team) {
       return res.status(404).json({ success: false, error: "Team not found" });
@@ -207,7 +268,7 @@ app.get('/api/target-image', async (req, res) => {
     if (teamId) {
       team = await Team.findById(teamId);
     }
-    
+
     if (!team) {
       team = await Team.findOne({ status: 'active' }) || await Team.findOne();
     }
@@ -307,65 +368,36 @@ const releasePythonLock = () => {
   }
 };
 
-const computeFallbackSimilarity = async (url1, url2, teamId) => {
-  try {
-    const cleanWords = (url) => {
-      try {
-        const decoded = decodeURIComponent(url);
-        const stopwords = new Set(['https', 'http', 'www', 'image', 'pollinations', 'ai', 'prompt', 'seed', 'width', 'height', 'nologo', 'model', 'jpg', 'png', 'jpeg', 'webp', 'picsum', 'photos', 'id', 'com', 'net', 'org', 'the', 'a', 'an', 'of', 'in', 'and', 'with', 'on', 'for', 'to', 'by', 'at', 'from', 'as', 'is', 'it']);
-        return decoded.replace(/[^a-zA-Z]+/g, ' ').toLowerCase().split(/\s+/).filter(w => w.length > 2 && !stopwords.has(w));
-      } catch (e) { return []; }
-    };
-    const words1 = cleanWords(url1);
-    const words2 = cleanWords(url2);
-    let score = 78.5;
-    if (words1.length > 0 && words2.length > 0) {
-      const set1 = new Set(words1);
-      const set2 = new Set(words2);
-      let matches = 0;
-      for (const w of set2) { if (set1.has(w)) matches++; }
-      const jaccard = matches / (set1.size + set2.size - matches || 1);
-      score = 68.0 + (jaccard * 26.0); // Map to 68.0 - 94.0
-    } else {
-      let hash = 0;
-      const str = String(teamId || "") + String(url1) + String(url2);
-      for (let i = 0; i < str.length; i++) { hash = (hash * 31 + str.charCodeAt(i)) % 1000; }
-      score = 71.0 + (hash % 180) / 10.0; // Map to 71.0 - 89.0
-    }
-    const finalScore = Math.round(score * 10) / 10;
-    if (teamId && Team && Team.findByIdAndUpdate) {
-      try {
-        await Team.findByIdAndUpdate(teamId, { 
-          score: finalScore, 
-          finalImageUrl: url2,
-          referenceImageUrl: url1
-        });
-      } catch (dbErr) {}
-      try {
-        const Submission = require('../models/Submission');
-        await Submission.findOneAndUpdate(
-          { team: teamId, round: 3 },
-          { similarityScore: finalScore },
-          { sort: { timestamp: -1 } }
-        );
-      } catch (err) {}
-    }
-    return { similarity_score: finalScore, fallback_mode: true };
-  } catch (err) {
-    return { similarity_score: 76.5, fallback_mode: true };
-  }
-};
+
 
 app.post('/api/similarity', async (req, res) => {
+  const simStart = Date.now();
+  const pushSimLog = (extra) => {
+    pushLog({
+      timestamp: new Date().toISOString(),
+      method: 'POST',
+      path: '/api/similarity',
+      statusCode: res.statusCode,
+      durationMs: Date.now() - simStart,
+      category: 'similarity',
+      ...extra,
+    });
+  };
+
   try {
     const { teamId, original_url, submitted_url } = req.body;
     if (!original_url || !submitted_url) {
+      pushSimLog({ similarityStatus: 'ERROR', error: 'Missing required URLs', teamId });
       return res.status(400).json({ error: "original_url and submitted_url are required" });
     }
 
     if (process.env.AI_SERVICE_URL) {
       try {
-        const response = await fetch(`${process.env.AI_SERVICE_URL}/api/similarity`, {
+        let aiServiceUrl = process.env.AI_SERVICE_URL;
+        if (!aiServiceUrl.startsWith('http')) {
+          aiServiceUrl = `https://${aiServiceUrl}`;
+        }
+        const response = await fetch(`${aiServiceUrl}/api/similarity`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ teamId, original_url, submitted_url })
@@ -375,47 +407,49 @@ app.post('/api/similarity', async (req, res) => {
           if (data && data.similarity_score !== undefined) {
             if (teamId && Team && Team.findByIdAndUpdate) {
               try {
-                await Team.findByIdAndUpdate(teamId, { 
-                    score: data.similarity_score, 
-                    finalImageUrl: submitted_url,
-                    referenceImageUrl: original_url
+                await Team.findByIdAndUpdate(teamId, {
+                  score: data.similarity_score,
+                  finalImageUrl: submitted_url,
+                  referenceImageUrl: original_url
                 });
               } catch (dbErr) { console.log("DB update ignored:", dbErr.message); }
               try {
                 const Submission = require('../models/Submission');
                 await Submission.findOneAndUpdate(
-                    { team: teamId, round: 3 },
-                    { similarityScore: data.similarity_score },
-                    { sort: { timestamp: -1 } }
+                  { team: teamId, round: 3 },
+                  { similarityScore: data.similarity_score },
+                  { sort: { timestamp: -1 } }
                 );
-              } catch (err) {}
+              } catch (err) { }
             }
+            pushSimLog({ similarityStatus: 'PASS', similarityScore: data.similarity_score, source: 'AI_SERVICE_URL', fallbackMode: false, teamId, originalUrl: original_url, submittedUrl: submitted_url });
             return res.json(data);
           }
         }
       } catch (e) {
         console.error("AI_SERVICE_URL call failed, falling back to local Python execution:", e.message);
+        pushSimLog({ similarityStatus: 'FAIL', error: 'AI_SERVICE_URL unreachable: ' + e.message, source: 'AI_SERVICE_URL', teamId, originalUrl: original_url, submittedUrl: submitted_url });
       }
     }
 
     try {
-      const resp = await fetch('http://127.0.0.1:5001/api/similarity', {
+      const resp = await fetch('http://127.0.0.1:5050/api/similarity', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ teamId, original_url, submitted_url }),
-        signal: AbortSignal.timeout(2500)
+        signal: AbortSignal.timeout(60000)
       });
       if (resp.ok) {
         const data = await resp.json();
         if (data && data.similarity_score !== undefined) {
           if (teamId && Team && Team.findByIdAndUpdate) {
             try {
-              await Team.findByIdAndUpdate(teamId, { 
-                score: data.similarity_score, 
+              await Team.findByIdAndUpdate(teamId, {
+                score: data.similarity_score,
                 finalImageUrl: submitted_url,
                 referenceImageUrl: original_url
               });
-            } catch (dbErr) {}
+            } catch (dbErr) { }
             try {
               const Submission = require('../models/Submission');
               await Submission.findOneAndUpdate(
@@ -423,12 +457,13 @@ app.post('/api/similarity', async (req, res) => {
                 { similarityScore: data.similarity_score },
                 { sort: { timestamp: -1 } }
               );
-            } catch (err) {}
+            } catch (err) { }
           }
+          pushSimLog({ similarityStatus: 'PASS', similarityScore: data.similarity_score, source: 'LOCAL_DAEMON', fallbackMode: false, teamId, originalUrl: original_url, submittedUrl: submitted_url });
           return res.json(data);
         }
       }
-    } catch (daemonErr) {}
+    } catch (daemonErr) { }
 
     const { execFile } = require('child_process');
     const path = require('path');
@@ -442,92 +477,97 @@ app.post('/api/similarity', async (req, res) => {
       for (const cmd of pythonCommands) {
         try {
           await new Promise((resolve, reject) => {
-            execFile(cmd, [scriptPath, original_url, submitted_url], { maxBuffer: 1024 * 1024 * 50, timeout: 3500 }, async (error, stdout, stderr) => {
-            if (error && error.code === 'ENOENT') {
-              return reject(error);
-            }
-            executed = true;
-            if (error && !stdout) {
-               console.error("AI Model error, using smart fallback:", error, stderr);
-               const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-               res.json(fb);
-               return resolve();
-            }
-            try {
-              let data = null;
-              const lines = (stdout || "").split('\n');
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-                  try {
-                    const parsed = JSON.parse(trimmed);
-                    if (parsed.similarity_score !== undefined || parsed.error) {
-                      data = parsed;
-                      break;
-                    }
-                  } catch (e) {}
+            execFile(cmd, [scriptPath, original_url, submitted_url], { maxBuffer: 1024 * 1024 * 50, timeout: 120000 }, async (error, stdout, stderr) => {
+              if (error && error.code === 'ENOENT') {
+                return reject(error);
+              }
+              executed = true;
+              if (error && !stdout) {
+                const errMsg = 'Python process error: ' + (error.message || '') + ' | stderr: ' + (stderr || '');
+                console.error("AI Model FAILED:", errMsg);
+                pushSimLog({ similarityStatus: 'ERROR', source: 'PYTHON_MODEL', fallbackMode: false, error: errMsg, teamId, originalUrl: original_url, submittedUrl: submitted_url });
+                res.status(500).json({ error: errMsg, similarity_score: null });
+                return resolve();
+              }
+              try {
+                let data = null;
+                const lines = (stdout || "").split('\n');
+                for (const line of lines) {
+                  const trimmed = line.trim();
+                  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                    try {
+                      const parsed = JSON.parse(trimmed);
+                      if (parsed.similarity_score !== undefined || parsed.error) {
+                        data = parsed;
+                        break;
+                      }
+                    } catch (e) { }
+                  }
                 }
-              }
-              if (!data) {
-                const match = (stdout || "").match(/\{[^{}]*"similarity_score"[^{}]*\}/) || (stdout || "").match(/\{[\s\S]*?\}/);
-                if (match) data = JSON.parse(match[0]);
-              }
-              if (!data) throw new Error("No valid JSON found in Python output: " + stdout);
-              
-              if (data.error) {
-                 const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-                 res.json(fb);
-                 return resolve();
-              }
-              
-              const score = data.similarity_score;
-              
-              if (teamId && Team && Team.findByIdAndUpdate) {
+                if (!data) {
+                  const match = (stdout || "").match(/\{[^{}]*"similarity_score"[^{}]*\}/) || (stdout || "").match(/\{[\s\S]*?\}/);
+                  if (match) data = JSON.parse(match[0]);
+                }
+                if (!data) throw new Error("No valid JSON found in Python output: " + stdout);
+
+                if (data.error) {
+                  const errMsg = 'Python returned error: ' + data.error;
+                  console.error("AI Model returned error:", errMsg);
+                  pushSimLog({ similarityStatus: 'ERROR', source: 'PYTHON_MODEL', fallbackMode: false, error: errMsg, teamId, originalUrl: original_url, submittedUrl: submitted_url });
+                  res.status(500).json({ error: errMsg, similarity_score: null });
+                  return resolve();
+                }
+
+                const score = data.similarity_score;
+
+                if (teamId && Team && Team.findByIdAndUpdate) {
                   try {
-                    await Team.findByIdAndUpdate(teamId, { 
-                        score: score, 
-                        finalImageUrl: submitted_url,
-                        referenceImageUrl: original_url
+                    await Team.findByIdAndUpdate(teamId, {
+                      score: score,
+                      finalImageUrl: submitted_url,
+                      referenceImageUrl: original_url
                     });
                   } catch (dbErr) { console.log("DB update ignored:", dbErr.message); }
-                  
+
                   try {
                     const Submission = require('../models/Submission');
                     await Submission.findOneAndUpdate(
-                        { team: teamId, round: 3 },
-                        { similarityScore: score },
-                        { sort: { timestamp: -1 } }
+                      { team: teamId, round: 3 },
+                      { similarityScore: score },
+                      { sort: { timestamp: -1 } }
                     );
-                  } catch (err) {}
+                  } catch (err) { }
+                }
+
+                pushSimLog({ similarityStatus: 'PASS', similarityScore: score, source: 'PYTHON_MODEL', fallbackMode: false, teamId, originalUrl: original_url, submittedUrl: submitted_url });
+                res.json(data);
+                resolve();
+              } catch (e) {
+                const errMsg = 'Failed to parse Python output: ' + e.message + ' | stdout: ' + (stdout || '');
+                console.error("AI parse FAILED:", errMsg);
+                pushSimLog({ similarityStatus: 'ERROR', source: 'PYTHON_MODEL', fallbackMode: false, error: errMsg, teamId, originalUrl: original_url, submittedUrl: submitted_url });
+                res.status(500).json({ error: errMsg, similarity_score: null });
+                resolve();
               }
-              
-              res.json(data);
-              resolve();
-            } catch (e) {
-              console.error("Failed to parse AI output, using smart fallback:", stdout, e);
-              const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-              res.json(fb);
-              resolve();
-            }
+            });
           });
-        });
-        if (executed) break;
-      } catch (e) {
-        if (e.code === 'ENOENT') continue;
-        break;
+          if (executed) break;
+        } catch (e) {
+          if (e.code === 'ENOENT') continue;
+          break;
+        }
       }
-    }
-    if (!executed) {
-      const fb = await computeFallbackSimilarity(original_url, submitted_url, teamId);
-      res.json(fb);
-    }
+      if (!executed) {
+        pushSimLog({ similarityStatus: 'ERROR', source: 'NO_PYTHON', fallbackMode: false, error: 'No Python interpreter found on server', teamId, originalUrl: original_url, submittedUrl: submitted_url });
+        res.status(500).json({ error: 'No Python interpreter found on server', similarity_score: null });
+      }
     } finally {
       releasePythonLock();
     }
   } catch (err) {
-    console.error("Similarity Error, using smart fallback:", err);
-    const fb = await computeFallbackSimilarity(req.body?.original_url || "", req.body?.submitted_url || "", req.body?.teamId);
-    res.json(fb);
+    console.error("Similarity CRITICAL ERROR:", err);
+    pushSimLog({ similarityStatus: 'ERROR', error: err.message, source: 'EXCEPTION', fallbackMode: false, teamId: req.body?.teamId });
+    res.status(500).json({ error: 'Similarity service failed: ' + err.message, similarity_score: null });
   }
 });
 
